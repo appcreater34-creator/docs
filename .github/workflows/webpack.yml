@@ -26,3 +26,483 @@ jobs:
       run: |
         npm install
         npx webpack
+
+'use strict';
+require('dotenv').config();
+
+const express    = require('express');
+const cors       = require('cors');
+const bodyParser = require('body-parser');
+const Stripe     = require('stripe');
+const axios      = require('axios');
+
+// ── Stripe client ─────────────────────────────────────────────
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
+  apiVersion: '2024-04-10',
+});
+
+// ── Express app ───────────────────────────────────────────────
+const app = express();
+
+// Stripe webhooks need raw body — mount BEFORE bodyParser
+app.use('/api/webhooks/stripe', bodyParser.raw({ type: 'application/json' }));
+
+app.use(cors({ origin: process.env.FRONTEND_URL || '*' }));
+app.use(express.json());
+app.use(express.static('.')); // serve index.html from same folder
+
+// ── In-memory DB (swap for PostgreSQL / Firebase / etc.) ──────
+let promoters = [
+  {
+    id: 'promo_001', name: 'Alex Rivera',  email: 'alex@example.com',
+    tier: 'gold',     revenue: 8400,  sales: 42,
+    stripe_id: 'acct_1RBxxxxAlex', connected: true, payouts_enabled: true,
+    method: 'stripe', paypal_email: null,
+  },
+  {
+    id: 'promo_002', name: 'Jordan Lee',   email: 'jordan@example.com',
+    tier: 'silver',   revenue: 2700,  sales: 18,
+    stripe_id: null, connected: false, payouts_enabled: false,
+    method: 'paypal', paypal_email: 'jordan@example.com',
+  },
+  {
+    id: 'promo_003', name: 'Morgan Kim',   email: 'morgan@example.com',
+    tier: 'bronze',   revenue: 500,   sales: 5,
+    stripe_id: null, connected: false, payouts_enabled: false,
+    method: 'paypal', paypal_email: 'morgan@example.com',
+  },
+  {
+    id: 'promo_004', name: 'Taylor Osei',  email: 'taylor@example.com',
+    tier: 'platinum', revenue: 21000, sales: 97,
+    stripe_id: 'acct_1RBxxxxTayl', connected: true, payouts_enabled: false,
+    method: 'stripe', paypal_email: null,
+  },
+  {
+    id: 'promo_005', name: 'Casey Marsh',  email: 'casey@example.com',
+    tier: 'silver',   revenue: 1900,  sales: 12,
+    stripe_id: null, connected: false, payouts_enabled: false,
+    method: 'stripe', paypal_email: null,
+  },
+];
+
+const payoutLog = [];
+
+const COMMISSION_RATES = {
+  bronze: 0.08, silver: 0.12, gold: 0.18, platinum: 0.25,
+};
+
+// ═══════════════════════════════════════════════════════════════
+//  ROUTES
+// ═══════════════════════════════════════════════════════════════
+
+// ── Health check ─────────────────────────────────────────────
+app.get('/api/health', (_req, res) => {
+  res.json({ status: 'ok', time: new Date().toISOString() });
+});
+
+// ── GET /api/promoters ────────────────────────────────────────
+app.get('/api/promoters', (_req, res) => {
+  res.json(promoters);
+});
+
+// ── GET /api/promoters/:id ────────────────────────────────────
+app.get('/api/promoters/:id', (req, res) => {
+  const p = promoters.find(x => x.id === req.params.id);
+  if (!p) return res.status(404).json({ error: 'Promoter not found' });
+  res.json(p);
+});
+
+// ── POST /api/promoters ───────────────────────────────────────
+app.post('/api/promoters', (req, res) => {
+  const { name, email, tier, revenue, sales, method, paypal_email } = req.body;
+  if (!name || !email) return res.status(400).json({ error: 'name and email required' });
+  const p = {
+    id: `promo_${Date.now()}`, name, email,
+    tier: tier || 'bronze', revenue: revenue || 0, sales: sales || 0,
+    stripe_id: null, connected: false, payouts_enabled: false,
+    method: method || 'stripe', paypal_email: paypal_email || null,
+  };
+  promoters.push(p);
+  res.status(201).json(p);
+});
+
+// ═══════════════════════════════════════════════════════════════
+//  STRIPE CONNECT — OAUTH FLOW
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * POST /api/stripe/connect-link
+ * Body: { promoter_id }
+ * Returns: { url } — the Stripe Connect OAuth URL to redirect to
+ */
+app.post('/api/stripe/connect-link', (req, res) => {
+  const { promoter_id } = req.body;
+  if (!promoter_id) return res.status(400).json({ error: 'promoter_id required' });
+
+  const params = new URLSearchParams({
+    response_type: 'code',
+    client_id:     process.env.STRIPE_CLIENT_ID,
+    scope:         'read_write',
+    redirect_uri:  process.env.REDIRECT_URI,
+    state:         promoter_id,
+  });
+
+  const url = `https://connect.stripe.com/oauth/authorize?${params}`;
+  res.json({ url });
+});
+
+/**
+ * GET /api/stripe/callback
+ * Stripe redirects here after user authorizes.
+ * Query params: code, state (promoter_id)
+ */
+app.get('/api/stripe/callback', async (req, res) => {
+  const { code, state: promoter_id, error, error_description } = req.query;
+
+  if (error) {
+    console.error('Stripe OAuth error:', error_description);
+    return res.redirect(`/?stripe_error=${encodeURIComponent(error_description)}`);
+  }
+
+  if (!code || !promoter_id) {
+    return res.status(400).json({ error: 'Missing code or state' });
+  }
+
+  try {
+    // Exchange code for access token + Stripe account ID
+    const response = await stripe.oauth.token({ grant_type: 'authorization_code', code });
+    const stripeAccountId = response.stripe_user_id;
+
+    // Retrieve account to check if payouts are enabled
+    const account = await stripe.accounts.retrieve(stripeAccountId);
+    const payoutsEnabled = account.payouts_enabled;
+
+    // Save to DB
+    promoters = promoters.map(p =>
+      p.id === promoter_id
+        ? { ...p, stripe_id: stripeAccountId, connected: true, payouts_enabled: payoutsEnabled }
+        : p
+    );
+
+    console.log(`✅ Promoter ${promoter_id} connected: ${stripeAccountId}`);
+
+    // Redirect back to frontend
+    res.redirect(`/?stripe_connected=1&promoter=${promoter_id}`);
+  } catch (err) {
+    console.error('OAuth token exchange failed:', err.message);
+    res.redirect(`/?stripe_error=${encodeURIComponent(err.message)}`);
+  }
+});
+
+/**
+ * GET /api/stripe/account-status/:promoter_id
+ * Refreshes the connected account's status from Stripe
+ */
+app.get('/api/stripe/account-status/:id', async (req, res) => {
+  const p = promoters.find(x => x.id === req.params.id);
+  if (!p || !p.stripe_id) return res.status(404).json({ error: 'No Stripe account linked' });
+
+  try {
+    const account = await stripe.accounts.retrieve(p.stripe_id);
+    const update  = { payouts_enabled: account.payouts_enabled, charges_enabled: account.charges_enabled };
+    promoters = promoters.map(x => x.id === p.id ? { ...x, ...update } : x);
+    res.json({ ...p, ...update, stripe_details_submitted: account.details_submitted });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+//  PAYOUTS
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * POST /api/payout
+ * Body: { promoter_id, amount_usd, method?, stripe_account_id?, paypal_email?, name? }
+ * Sends a commission payout via Stripe or PayPal
+ */
+app.post('/api/payout', async (req, res) => {
+  let { promoter_id, amount_usd, method, stripe_account_id, paypal_email, name } = req.body;
+
+  if (!promoter_id || !amount_usd) {
+    return res.status(400).json({ error: 'promoter_id and amount_usd required' });
+  }
+
+  // Resolve promoter
+  const p = promoters.find(x => x.id === promoter_id);
+  if (p) {
+    method            = method            || p.method;
+    stripe_account_id = stripe_account_id || p.stripe_id;
+    paypal_email      = paypal_email      || p.paypal_email || p.email;
+    name              = name              || p.name;
+  }
+
+  // Auto-calculate commission if not supplied
+  if (!amount_usd && p) {
+    const rate = COMMISSION_RATES[p.tier] || 0.08;
+    let bonus = 0;
+    if (p.sales > 30)    bonus += 0.02;
+    if (p.revenue > 5000) bonus += 0.03;
+    const totalRate = Math.min(rate + bonus, 0.30);
+    amount_usd = Math.round(p.revenue * totalRate * 100) / 100;
+  }
+
+  if (amount_usd < 1) {
+    return res.status(400).json({ error: 'Amount must be at least $1.00' });
+  }
+
+  try {
+    let result;
+    if (method === 'stripe') {
+      result = await stripeTransfer(stripe_account_id, amount_usd, name, promoter_id);
+    } else {
+      result = await paypalPayout(paypal_email, amount_usd, name, promoter_id);
+    }
+
+    payoutLog.push({
+      ...result,
+      promoter_id,
+      promoter: name,
+      amount: amount_usd,
+      time: new Date().toISOString(),
+    });
+
+    res.json(result);
+  } catch (err) {
+    console.error('Payout error:', err.message);
+    res.status(500).json({ status: 'error', error: err.message });
+  }
+});
+
+/**
+ * POST /api/payout/batch
+ * Runs commission payouts for ALL connected + payouts_enabled promoters
+ */
+app.post('/api/payout/batch', async (req, res) => {
+  const eligible = promoters.filter(p => p.connected && p.payouts_enabled);
+  const results  = [];
+
+  for (const p of eligible) {
+    const rate    = COMMISSION_RATES[p.tier] || 0.08;
+    let bonus = 0;
+    if (p.sales > 30)    bonus += 0.02;
+    if (p.revenue > 5000) bonus += 0.03;
+    const totalRate = Math.min(rate + bonus, 0.30);
+    const amount    = Math.round(p.revenue * totalRate * 100) / 100;
+
+    if (amount < 1) { results.push({ promoter: p.name, status: 'skipped', reason: 'amount < $1' }); continue; }
+
+    try {
+      let r;
+      if (p.method === 'stripe') {
+        r = await stripeTransfer(p.stripe_id, amount, p.name, p.id);
+      } else {
+        r = await paypalPayout(p.paypal_email || p.email, amount, p.name, p.id);
+      }
+      payoutLog.push({ ...r, promoter_id: p.id, promoter: p.name, amount, time: new Date().toISOString() });
+      results.push({ promoter: p.name, ...r });
+    } catch (err) {
+      results.push({ promoter: p.name, status: 'error', error: err.message });
+    }
+  }
+
+  const total = results.filter(r => r.status === 'success').reduce((s,r) => s + (r.amount||0), 0);
+  res.json({ summary: { processed: results.length, total_paid: total }, results });
+});
+
+// ── GET /api/payout/logs ──────────────────────────────────────
+app.get('/api/payout/logs', (_req, res) => {
+  res.json(payoutLog.slice().reverse());
+});
+
+// ═══════════════════════════════════════════════════════════════
+//  CONFIG ENDPOINT
+// ═══════════════════════════════════════════════════════════════
+
+app.post('/api/config', (req, res) => {
+  // In production: write to a secure secrets manager, NOT process.env
+  // Here we just acknowledge so the frontend save button works
+  console.log('Config updated (keys not shown)');
+  res.json({ status: 'ok' });
+});
+
+// ═══════════════════════════════════════════════════════════════
+//  STRIPE WEBHOOKS
+// ═══════════════════════════════════════════════════════════════
+
+app.post('/api/webhooks/stripe', (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  let event;
+
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    console.error('Webhook signature failed:', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  console.log(`Webhook received: ${event.type}`);
+
+  switch (event.type) {
+
+    case 'account.updated': {
+      const acct = event.data.object;
+      promoters = promoters.map(p =>
+        p.stripe_id === acct.id
+          ? { ...p, payouts_enabled: acct.payouts_enabled }
+          : p
+      );
+      console.log(`Account ${acct.id} payouts_enabled → ${acct.payouts_enabled}`);
+      break;
+    }
+
+    case 'transfer.created': {
+      const t = event.data.object;
+      console.log(`Transfer created: ${t.id} — $${t.amount/100} to ${t.destination}`);
+      break;
+    }
+
+    case 'payout.paid': {
+      const pay = event.data.object;
+      console.log(`Payout PAID: ${pay.id} — $${pay.amount/100}`);
+      break;
+    }
+
+    case 'payout.failed': {
+      const pay = event.data.object;
+      console.error(`⚠ Payout FAILED: ${pay.id} — ${pay.failure_message}`);
+      break;
+    }
+
+    case 'account.application.deauthorized': {
+      const acct = event.account;
+      promoters = promoters.map(p =>
+        p.stripe_id === acct
+          ? { ...p, connected: false, payouts_enabled: false, stripe_id: null }
+          : p
+      );
+      console.log(`Account ${acct} disconnected Stripe`);
+      break;
+    }
+
+    default:
+      console.log(`Unhandled event type: ${event.type}`);
+  }
+
+  res.json({ received: true });
+});
+
+// ═══════════════════════════════════════════════════════════════
+//  HELPER: STRIPE TRANSFER
+// ═══════════════════════════════════════════════════════════════
+
+async function stripeTransfer(accountId, amountUsd, promoterName, promoterId) {
+  if (!accountId) throw new Error('No Stripe account ID — promoter must connect first');
+
+  const amountCents = Math.round(amountUsd * 100);
+  const transfer = await stripe.transfers.create({
+    amount:      amountCents,
+    currency:    'usd',
+    destination: accountId,
+    description: `Commission — ${promoterName} — ${new Date().toISOString().slice(0,10)}`,
+    metadata: {
+      promoter_id:   promoterId,
+      promoter_name: promoterName,
+      payout_date:   new Date().toISOString(),
+    },
+  });
+
+  return {
+    status:    'success',
+    method:    'stripe',
+    ref:       transfer.id,
+    amount:    amountUsd,
+    account:   accountId,
+    promoter:  promoterName,
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  HELPER: PAYPAL PAYOUT
+// ═══════════════════════════════════════════════════════════════
+
+async function getPayPalToken() {
+  const base = process.env.PAYPAL_ENV === 'live'
+    ? 'https://api-m.paypal.com'
+    : 'https://api-m.sandbox.paypal.com';
+
+  const resp = await axios.post(
+    `${base}/v1/oauth2/token`,
+    'grant_type=client_credentials',
+    {
+      auth: {
+        username: process.env.PAYPAL_CLIENT_ID,
+        password: process.env.PAYPAL_SECRET,
+      },
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    }
+  );
+  return { token: resp.data.access_token, base };
+}
+
+async function paypalPayout(email, amountUsd, promoterName, promoterId) {
+  const { token, base } = await getPayPalToken();
+
+  const batchId = `COMM_${promoterId}_${Date.now()}`;
+  const payload = {
+    sender_batch_header: {
+      sender_batch_id: batchId,
+      email_subject:   `Your commission of $${amountUsd.toFixed(2)} has arrived!`,
+      email_message:   `Hi ${promoterName}, your commission payout is here. Thanks for all your work!`,
+    },
+    items: [
+      {
+        recipient_type:  'EMAIL',
+        amount:          { value: amountUsd.toFixed(2), currency: 'USD' },
+        receiver:        email,
+        note:            `Commission — ${new Date().toISOString().slice(0,7)}`,
+        sender_item_id:  `item_${promoterId}_${Date.now()}`,
+      },
+    ],
+  };
+
+  const resp = await axios.post(
+    `${base}/v1/payments/payouts`,
+    payload,
+    {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+    }
+  );
+
+  return {
+    status:   'success',
+    method:   'stripe
+    ref:      resp.data.batch_header.payout_batch_id,
+    amount:   amountUsd,
+    email:    email,
+    promoter: promoterName,
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  START SERVER
+// ═══════════════════════════════════════════════════════════════
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`
+  ⚡  AutoPilot Commission Server
+  ────────────────────────────────
+  🌐  http://localhost:${PORT}
+  📡  API  http://localhost:${PORT}/api
+  ────────────────────────────────
+  Stripe key:   ${process.env.STRIPE_SECRET_KEY ? '✅ Set' : '❌ Missing'}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
+  Stripe client:${process.env.STRIPE_CLIENT_ID  ? '✅ Set' : '❌ Missing'}acct_1TKvCkJdYvd8TslK
+
+  ────────────────────────────────
+  `);rin dev
+  
+});
